@@ -36,44 +36,51 @@ class PoissonMatchPredictor:
         self.params = None
         self.is_fitted = False
 
-    def _lambda(self, elo_diff: float, ranking_diff: float, is_neutral: bool, params: np.ndarray) -> float:
+    def _lambda(self, elo_diff: float, ranking_diff: float, is_home: int, form_scored: float, squad_rating_diff: float, params: np.ndarray) -> float:
         """Compute expected goals (λ) given features and parameters."""
-        b0, b_elo, b_rank, b_neutral = params
-        return np.exp(b0 + b_elo * elo_diff + b_rank * ranking_diff + b_neutral * float(is_neutral))
+        b0, b_elo, b_rank, b_home, b_form, b_squad = params
+        return np.exp(
+            b0 + b_elo * elo_diff + b_rank * ranking_diff
+            + b_home * is_home + b_form * form_scored
+            + b_squad * squad_rating_diff
+        )
 
-    def _neg_log_likelihood(self, params: np.ndarray, X: np.ndarray, y: np.ndarray) -> float:
-        """Negative log-likelihood for Poisson regression."""
-        elo_diff, ranking_diff, is_neutral = X[:, 0], X[:, 1], X[:, 2]
-        lam = np.exp(params[0] + params[1] * elo_diff + params[2] * ranking_diff + params[3] * is_neutral)
-        lam = np.clip(lam, 1e-6, 20)
-        nll = -np.sum(poisson.logpmf(y.astype(int), lam))
+    def _neg_log_likelihood(self, params: np.ndarray, X: np.ndarray, y: np.ndarray, weights: np.ndarray) -> float:
+        """Weighted negative log-likelihood for Poisson regression."""
+        elo_diff, ranking_diff, is_home, form_scored, squad_diff = X[:, 0], X[:, 1], X[:, 2], X[:, 3], X[:, 4]
+        log_lam = (params[0] + params[1] * elo_diff + params[2] * ranking_diff
+                   + params[3] * is_home + params[4] * form_scored + params[5] * squad_diff)
+        lam = np.exp(np.clip(log_lam, -10, 3))  # clip before exp to prevent overflow
+        nll = -np.sum(weights * poisson.logpmf(y.astype(int), lam))
         return nll
 
     def fit(self, features: pd.DataFrame) -> "PoissonMatchPredictor":
         """Fit the model on historical match data."""
-        df = features.dropna(subset=["elo_diff", "ranking_diff", "goals_scored"])
+        df = features.dropna(subset=["elo_diff", "ranking_diff", "goals_scored", "is_home", "form_scored"])
+        df["squad_rating_diff"] = df["squad_rating_diff"].fillna(0) if "squad_rating_diff" in df.columns else 0
 
-        X = df[["elo_diff", "ranking_diff", "is_neutral"]].values.astype(float)
+        X = df[["elo_diff", "ranking_diff", "is_home", "form_scored", "squad_rating_diff"]].values.astype(float)
         y = df["goals_scored"].values.astype(float)
+        weights = df["match_weight"].values.astype(float) if "match_weight" in df.columns else np.ones(len(df))
 
-        x0 = np.array([0.2, 0.001, -0.001, 0.0])
+        x0 = np.array([0.0, 0.001, -0.001, 0.1, 0.1, 0.01])
         result = minimize(
             self._neg_log_likelihood,
             x0,
-            args=(X, y),
+            args=(X, y, weights),
             method="L-BFGS-B",
             options={"maxiter": 1000},
         )
 
         self.params = result.x
         self.is_fitted = True
-        print(f"[+] Model fitted. Params: {dict(zip(['β₀','β_elo','β_rank','β_neutral'], self.params.round(4)))}")
+        print(f"[+] Model fitted. Params: {dict(zip(['β₀','β_elo','β_rank','β_home','β_form','β_squad'], self.params.round(4)))}")
         return self
 
-    def predict_goals(self, elo_diff: float, ranking_diff: float, is_neutral: bool = True) -> float:
+    def predict_goals(self, elo_diff: float, ranking_diff: float, is_home: int = 0, form_scored: float = 1.3, squad_rating_diff: float = 0.0, rd_combined: float = 100.0) -> float:
         """Predict expected goals for a team given match features."""
         assert self.is_fitted, "Model not fitted yet."
-        return self._lambda(elo_diff, ranking_diff, is_neutral, self.params)
+        return self._lambda(elo_diff, ranking_diff, is_home, form_scored, squad_rating_diff, self.params)
 
     def predict_match(
         self,
@@ -82,6 +89,12 @@ class PoissonMatchPredictor:
         rank_home: float = None,
         rank_away: float = None,
         is_neutral: bool = True,
+        form_home: float = 1.3,
+        form_away: float = 1.3,
+        squad_home: float = 74.0,
+        squad_away: float = 74.0,
+        rd_home: float = 100.0,
+        rd_away: float = 100.0,
     ) -> dict:
         """
         Predict Win/Draw/Loss probabilities for a match.
@@ -97,16 +110,31 @@ class PoissonMatchPredictor:
         elo_diff_away = elo_away - elo_home
         rank_diff_home = (rank_home - rank_away) if rank_home and rank_away else 0
         rank_diff_away = -rank_diff_home
+        home_advantage = 0 if is_neutral else 1
+        squad_diff = squad_home - squad_away
 
-        lam_home = self.predict_goals(elo_diff_home, rank_diff_home, is_neutral)
-        lam_away = self.predict_goals(elo_diff_away, rank_diff_away, is_neutral)
+        lam_home = self.predict_goals(elo_diff_home, rank_diff_home, home_advantage, form_home,  squad_diff)
+        lam_away = self.predict_goals(elo_diff_away, rank_diff_away, 0,              form_away, -squad_diff)
 
-        # Build score probability matrix
+        # Build score probability matrix with Dixon-Coles correction.
+        # The basic Poisson model underestimates 0-0 and 1-1 draws and
+        # overestimates 0-1 / 1-0. The DC correction factor ρ (rho) fixes
+        # this by adjusting probabilities for the four low-scoring outcomes.
+        # ρ ≈ -0.13 is the standard estimate for international football
+        # (Dixon & Coles, 1997).
         mg = self.max_goals
+        rho = -0.13
         score_matrix = np.outer(
             poisson.pmf(np.arange(mg + 1), lam_home),
             poisson.pmf(np.arange(mg + 1), lam_away),
         )
+        # Apply correction only to the 2×2 low-score block
+        score_matrix[0, 0] *= (1 - rho * lam_home * lam_away)
+        score_matrix[0, 1] *= (1 + rho * lam_home)
+        score_matrix[1, 0] *= (1 + rho * lam_away)
+        score_matrix[1, 1] *= (1 - rho)
+        score_matrix = np.clip(score_matrix, 0, None)
+        score_matrix /= score_matrix.sum()  # renormalise
 
         prob_home_win = np.tril(score_matrix, -1).sum()
         prob_draw = np.trace(score_matrix)
@@ -128,14 +156,22 @@ class PoissonMatchPredictor:
         }
 
     def save(self, path: str = "models/poisson_model.pkl"):
+        data = {
+            "params": self.params.tolist(),
+            "max_goals": self.max_goals,
+            "is_fitted": self.is_fitted,
+        }
         with open(path, "wb") as f:
-            pickle.dump(self, f)
+            pickle.dump(data, f)
         print(f"[+] Model saved to {path}")
 
     @staticmethod
     def load(path: str = "models/poisson_model.pkl") -> "PoissonMatchPredictor":
         with open(path, "rb") as f:
-            model = pickle.load(f)
+            data = pickle.load(f)
+        model = PoissonMatchPredictor(max_goals=data["max_goals"])
+        model.params = np.array(data["params"])
+        model.is_fitted = data["is_fitted"]
         print(f"[+] Model loaded from {path}")
         return model
 
@@ -162,14 +198,63 @@ def train_and_evaluate():
     model.save()
 
     # Simple evaluation: MAE on goals
-    test = test.dropna(subset=["elo_diff", "ranking_diff"])
+    test = test.dropna(subset=["elo_diff", "ranking_diff", "is_home", "form_scored", "goals_scored"])
+    test["squad_rating_diff"] = test["squad_rating_diff"].fillna(0) if "squad_rating_diff" in test.columns else 0
     preds = []
     for _, row in test.iterrows():
-        lam = model.predict_goals(row["elo_diff"], row["ranking_diff"], row["is_neutral"])
+        lam = model.predict_goals(row["elo_diff"], row["ranking_diff"], row["is_home"], row["form_scored"], row.get("squad_rating_diff", 0))
         preds.append(lam)
 
     mae = np.mean(np.abs(test["goals_scored"].values - np.array(preds)))
     print(f"[+] Test MAE (goals): {mae:.4f}")
+
+    # Match-level evaluation: log-loss and F1
+    from sklearn.metrics import log_loss, f1_score
+
+    # One row per match: take team < opponent alphabetically as "team A"
+    test["date_str"] = test["date"].astype(str)
+    test_a = test[test["team"].astype(str) < test["opponent"].astype(str)].copy()
+    test_b = test[test["team"].astype(str) > test["opponent"].astype(str)][
+        ["team", "opponent", "date_str", "form_scored"]
+    ].rename(columns={"team": "opponent", "opponent": "team", "form_scored": "form_opponent"})
+
+    test_matches = test_a.merge(test_b, on=["team", "opponent", "date_str"], how="left")
+    test_matches["form_opponent"] = test_matches["form_opponent"].fillna(1.3)
+    test_matches["squad_rating_diff"] = test_matches["squad_rating_diff"].fillna(0)
+    test_matches["ranking_diff"] = test_matches["ranking_diff"].fillna(0)
+
+    y_true = np.where(
+        test_matches["goals_scored"] > test_matches["goals_conceded"], 0,
+        np.where(test_matches["goals_scored"] == test_matches["goals_conceded"], 1, 2)
+    )
+
+    probs = []
+    for _, row in test_matches.iterrows():
+        ed = row["elo_diff"]
+        rd = row["ranking_diff"]
+        ih = row["is_home"]
+        fa = row["form_scored"]
+        fb = row["form_opponent"]
+        sq = row["squad_rating_diff"]
+
+        lam_a = model.predict_goals(ed, rd, ih, fa, sq)
+        lam_b = model.predict_goals(-ed, -rd, 0, fb, -sq)
+
+        mg = model.max_goals
+        sm = np.outer(poisson.pmf(np.arange(mg + 1), lam_a),
+                      poisson.pmf(np.arange(mg + 1), lam_b))
+        p = [np.tril(sm, -1).sum(), np.trace(sm), np.triu(sm, 1).sum()]
+        p = [max(x, 1e-7) for x in p]
+        s = sum(p)
+        probs.append([x / s for x in p])
+
+    probs = np.array(probs)
+    y_pred = np.argmax(probs, axis=1)
+
+    ll = log_loss(y_true, probs)
+    f1 = f1_score(y_true, y_pred, average="weighted")
+    print(f"[+] Log-loss (W/D/L): {ll:.4f}")
+    print(f"[+] F1 score (weighted): {f1:.4f}")
 
     return model
 
