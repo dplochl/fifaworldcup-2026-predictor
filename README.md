@@ -1,15 +1,15 @@
 # ⚽ FIFA World Cup 2026 Predictor
 
-A statistical model for predicting the 2026 FIFA World Cup — built with Poisson regression, Glicko-1 ratings, and 10,000 Monte Carlo simulations of the full 48-team tournament.
+A statistical model for predicting the 2026 FIFA World Cup - built with Poisson regression, Glicko-1 ratings, and 10,000 Monte Carlo simulations of the full 48-team tournament.
 
 ![Tournament Odds](assets/screenshot_odds.png)
 
 ## Features
 
-- **Tournament Odds** — Win probabilities for all 48 teams from 10,000 Monte Carlo simulations, with per-team stage breakdown
-- **Group Stage Predictor** — Most likely scoreline for all 72 group matches, with predicted final standings and 3rd-place qualifiers
-- **Head-to-Head Predictor** — Win/draw/loss probabilities and a full score probability matrix for any WC 2026 matchup
-- **Model vs FIFA Rankings** — See which teams the model rates differently from the official FIFA rankings
+- **Tournament Odds** - Win probabilities for all 48 teams from 10,000 Monte Carlo simulations, with per-team stage breakdown
+- **Group Stage Predictor** - Most likely scoreline for all 72 group matches, with predicted final standings and 3rd-place qualifiers
+- **Head-to-Head Predictor** - Win/draw/loss probabilities and a full score probability matrix for any WC 2026 matchup
+- **Model vs FIFA Rankings** - See which teams the model rates differently from the official FIFA rankings
 
 ## Screenshots
 
@@ -32,10 +32,10 @@ Goals scored by each team are modelled as **Poisson(λ)**:
 |---|---|
 | `elo_diff` | Glicko-1 rating difference (uncertainty-aware, replaces classic Elo) |
 | `ranking_diff` | FIFA ranking difference |
-| `is_home` | Home advantage — applied for host nations USA, Canada, Mexico |
+| `is_home` | Home advantage - applied for host nations USA, Canada, Mexico |
 | `form_scored` | Rolling average goals scored over the last 10 matches |
 | `squad_rating_diff` | EA FC squad average overall rating difference |
-| `rd_combined` | Average Glicko rating deviation — high uncertainty shrinks predictions toward 50/50 |
+| `rd_combined` | Average Glicko rating deviation - high uncertainty shrinks predictions toward 50/50 |
 
 Win/Draw/Loss probabilities come from the joint score distribution, with a **Dixon-Coles correction** (ρ = −0.13) for low-scoring outcomes.
 
