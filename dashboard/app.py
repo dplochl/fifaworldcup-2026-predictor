@@ -141,11 +141,6 @@ def load_simulation_results():
     p = PROCESSED / "simulation_results.csv"
     return pd.read_csv(p) if p.exists() else None
 
-@st.cache_data
-def load_matches():
-    p = PROCESSED / "matches_processed.csv"
-    return pd.read_csv(p, parse_dates=["date"]) if p.exists() else None
-
 @st.cache_resource
 def load_model():
     try:
@@ -207,37 +202,13 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
     st.caption("*Poisson regression + Monte Carlo*")
-    wc_page = st.radio("", [
+    page = st.radio("", [
         "🏆 Tournament Odds",
         "🔍 Model vs. FIFA Rankings",
         "📊 Group Tables",
-    ], label_visibility="collapsed")
-
-    st.divider()
-    st.markdown("## 🌍 International Predictor")
-    intl_page = st.radio("", [
         "⚔️ Match Predictor",
-        "👤 Team Profile",
         "📖 Model Info",
     ], label_visibility="collapsed")
-
-# Determine active page (last interacted radio wins — use session state trick)
-if "last_section" not in st.session_state:
-    st.session_state.last_section = "wc"
-
-# Simple priority: if user clicks a WC option we show that; if intl, we show that.
-# We track which was changed by checking against stored values.
-if "prev_wc"   not in st.session_state: st.session_state.prev_wc   = wc_page
-if "prev_intl" not in st.session_state: st.session_state.prev_intl = intl_page
-
-if wc_page != st.session_state.prev_wc:
-    st.session_state.last_section = "wc"
-    st.session_state.prev_wc = wc_page
-if intl_page != st.session_state.prev_intl:
-    st.session_state.last_section = "intl"
-    st.session_state.prev_intl = intl_page
-
-page = wc_page if st.session_state.last_section == "wc" else intl_page
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -394,14 +365,11 @@ elif page == "🔍 Model vs. FIFA Rankings":
 # WC 2026 — Page 4: Group Tables
 # ══════════════════════════════════════════════════════════════════════════════
 elif page == "📊 Group Tables":
-    from data_loader import (WC2026_GROUPS, WC2026_R32_BRACKET,
-                              WC2026_THIRD_PLACE_ELIGIBLE, WC2026_R16_PAIRS,
-                              WC2026_QF_PAIRS, WC2026_SF_PAIRS,
-                              TEAM_FLAGS, HOST_NATIONS)
+    from data_loader import WC2026_GROUPS, TEAM_FLAGS, HOST_NATIONS
     from itertools import combinations
 
-    st.title("⚽ Full Tournament Predictor")
-    st.caption("Model's most likely outcome for every match — group stage through the final")
+    st.title("⚽ Group Stage Predictor")
+    st.caption("Model's most likely outcome for every group match")
 
     elo_df = load_elo()
     model  = load_model()
@@ -418,75 +386,38 @@ elif page == "📊 Group Tables":
     def flag_t(t):
         return f"{TEAM_FLAGS.get(t, '')} {t}"
 
-    def _decisive_score(p):
-        """For knockout matches: most likely score conditioned on the most likely outcome.
-        Avoids the Poisson mode landing on a draw for every near-even matchup — the global
-        score mode is often 1-1 even when one team is clearly favoured in aggregate."""
-        matrix = p.get("score_matrix")
-        if matrix is None:
-            return map(int, p["most_likely_score"].split("–"))
-        n = min(matrix.shape[0], 9)
-        m = matrix[:n, :n]
-        rows, cols = np.indices((n, n))
-        ph, pd_val, pa = p["prob_home_win"], p["prob_draw"], p["prob_away_win"]
-        if ph >= pa and ph >= pd_val:
-            mask = rows > cols      # home-win scorelines
-        elif pa > ph and pa >= pd_val:
-            mask = cols > rows      # away-win scorelines
-        else:
-            mask = rows == cols     # draw scorelines → will trigger penalties
-        r, c = np.unravel_index(np.where(mask, m, 0).argmax(), m.shape)
-        return int(r), int(c)
-
-    def predict_game(t1, t2, knockout=False):
-        """Predict a match; handles host nation home advantage for group stage."""
-        if not knockout and t2 in HOST_NATIONS and t1 not in HOST_NATIONS:
+    def predict_game(t1, t2):
+        """Predict a group match; handles host nation home advantage."""
+        if t2 in HOST_NATIONS and t1 not in HOST_NATIONS:
             p = predict(t2, t1, elo_dict, form, squad, rd_dict, neutral=False)
             if not p:
                 return None
-            hg, ag = _decisive_score(p) if knockout else map(int, p["most_likely_score"].split("–"))
+            hg, ag = map(int, p["most_likely_score"].split("–"))
             return dict(t1=t1, t2=t2, g1=ag, g2=hg,
                         p1=p["prob_away_win"], pd=p["prob_draw"], p2=p["prob_home_win"])
-        if not knockout and t1 in HOST_NATIONS:
-            p = predict(t1, t2, elo_dict, form, squad, rd_dict, neutral=False)
-        else:
-            p = predict(t1, t2, elo_dict, form, squad, rd_dict, neutral=True)
+        neutral = t1 not in HOST_NATIONS
+        p = predict(t1, t2, elo_dict, form, squad, rd_dict, neutral=neutral)
         if not p:
             return None
-        hg, ag = _decisive_score(p) if knockout else map(int, p["most_likely_score"].split("–"))
+        hg, ag = map(int, p["most_likely_score"].split("–"))
         return dict(t1=t1, t2=t2, g1=hg, g2=ag,
                     p1=p["prob_home_win"], pd=p["prob_draw"], p2=p["prob_away_win"])
 
-    def ko_winner(m):
-        """Return (winner, went_to_pens). Draw → higher win-prob team advances."""
-        if m["g1"] > m["g2"]:
-            return m["t1"], False
-        if m["g2"] > m["g1"]:
-            return m["t2"], False
-        return (m["t1"] if m["p1"] >= m["p2"] else m["t2"]), True
-
-    def match_card(m, show_probs=True, ko=False):
-        """Render a match result as an HTML card."""
-        if ko:
-            w, pens = ko_winner(m)
-        else:
-            g1, g2 = m["g1"], m["g2"]
-            w = m["t1"] if g1 > g2 else (m["t2"] if g2 > g1 else None)
-            pens = False
+    def match_card(m):
+        """Render a group match as an HTML card."""
+        g1, g2 = m["g1"], m["g2"]
+        w = m["t1"] if g1 > g2 else (m["t2"] if g2 > g1 else None)
         t1_style = "font-weight:700;color:#C4981F" if w == m["t1"] else "color:#E8E8E8"
         t2_style = "font-weight:700;color:#C4981F" if w == m["t2"] else "color:#E8E8E8"
-        score = f"{m['g1']}–{m['g2']}" + (" (pens)" if pens else "")
-        prob_row = ""
-        if show_probs:
-            prob_row = (f"<div style='font-size:0.68rem;color:#8A9BC0;"
-                        f"text-align:center;margin-top:3px'>"
-                        f"{m['p1']*100:.0f}% · {m['pd']*100:.0f}% · {m['p2']*100:.0f}%</div>")
+        prob_row = (f"<div style='font-size:0.68rem;color:#8A9BC0;"
+                    f"text-align:center;margin-top:3px'>"
+                    f"{m['p1']*100:.0f}% · {m['pd']*100:.0f}% · {m['p2']*100:.0f}%</div>")
         return (f"<div style='background:linear-gradient(135deg,#0E1628,#121E38);"
                 f"border:1px solid #1E2F50;border-radius:8px;padding:10px 14px;margin:4px 0'>"
                 f"<div style='display:flex;justify-content:space-between;align-items:center;gap:6px'>"
                 f"<span style='{t1_style};flex:1'>{flag_t(m['t1'])}</span>"
                 f"<span style='color:#C4A030;font-weight:700;font-size:1rem;"
-                f"white-space:nowrap'>{score}</span>"
+                f"white-space:nowrap'>{g1}–{g2}</span>"
                 f"<span style='{t2_style};flex:1;text-align:right'>{flag_t(m['t2'])}</span>"
                 f"</div>{prob_row}</div>")
 
@@ -510,104 +441,30 @@ elif page == "📊 Group Tables":
                         reverse=True)
         return ranked, tbl
 
-    # ── compute all predictions (cached in session state per elo snapshot) ────
-    cache_key = f"tourn_{round(elo_df['elo'].sum())}"
+    # ── compute predictions (cached in session state per elo snapshot) ────────
+    cache_key = f"groups_{round(elo_df['elo'].sum())}"
     if cache_key not in st.session_state:
-        with st.spinner("Running model predictions for all 103 matches…"):
-
-            # Group stage
-            gp = {}
+        with st.spinner("Running group stage predictions…"):
+            gp, standings, thirds = {}, {}, []
             for group, teams in WC2026_GROUPS.items():
-                matches = []
-                for t1, t2 in combinations(teams, 2):
-                    m = predict_game(t1, t2)
-                    if m:
-                        matches.append(m)
+                matches = [m for t1, t2 in combinations(teams, 2)
+                           if (m := predict_game(t1, t2)) is not None]
                 gp[group] = matches
-
-            # Standings + qualification
-            standings, thirds, qualifiers = {}, [], {}
-            for group, teams in WC2026_GROUPS.items():
-                ranked, tbl = compute_standings(gp[group], teams)
+                ranked, tbl = compute_standings(matches, teams)
                 standings[group] = {"ranked": ranked, "table": tbl}
-                qualifiers[group] = {"W": ranked[0], "R": ranked[1]}
                 t3 = ranked[2]
                 thirds.append(dict(team=t3, group=group,
                                    pts=tbl[t3]["Pts"], gd=tbl[t3]["GD"], gf=tbl[t3]["GF"]))
-
             thirds.sort(key=lambda x: (x["pts"], x["gd"], x["gf"]), reverse=True)
-            avail = list(thirds[:8])
-            third_assign = {}
-            for slot in [74, 77, 79, 80, 81, 82, 85, 87]:
-                elig = WC2026_THIRD_PLACE_ELIGIBLE.get(slot, set())
-                assigned = False
-                for i, t in enumerate(avail):
-                    if t["group"] in elig:
-                        third_assign[slot] = t["team"]
-                        avail.pop(i)
-                        assigned = True
-                        break
-                if not assigned and avail:
-                    third_assign[slot] = avail.pop(0)["team"]
-
-            def resolve(slot):
-                k, ref = slot
-                if k == "W":
-                    return qualifiers[ref]["W"]
-                if k == "R":
-                    return qualifiers[ref]["R"]
-                return third_assign.get(ref, "TBD")
-
-            # R32
-            r32 = []
-            for mnum, s1, s2 in WC2026_R32_BRACKET:
-                t1, t2 = resolve(s1), resolve(s2)
-                m = predict_game(t1, t2, knockout=True)
-                if m:
-                    w, pens = ko_winner(m)
-                    r32.append({**m, "winner": w, "pens": pens, "match_num": mnum})
-
-            def sim_ko_round(pairs, prev):
-                result = []
-                for i, j in pairs:
-                    t1, t2 = prev[i]["winner"], prev[j]["winner"]
-                    m = predict_game(t1, t2, knockout=True)
-                    if m:
-                        w, pens = ko_winner(m)
-                        result.append({**m, "winner": w, "pens": pens})
-                return result
-
-            r16   = sim_ko_round(WC2026_R16_PAIRS, r32)
-            qf    = sim_ko_round(WC2026_QF_PAIRS,  r16)
-            sf    = sim_ko_round(WC2026_SF_PAIRS,   qf)
-
-            final_t1, final_t2 = sf[0]["winner"], sf[1]["winner"]
-            final_m = predict_game(final_t1, final_t2, knockout=True)
-            if final_m:
-                champ, final_pens = ko_winner(final_m)
-                final_m.update(winner=champ, pens=final_pens)
-
-            st.session_state[cache_key] = dict(
-                gp=gp, standings=standings, thirds=thirds,
-                r32=r32, r16=r16, qf=qf, sf=sf,
-                final_m=final_m, champion=final_m["winner"] if final_m else "?"
-            )
+            st.session_state[cache_key] = dict(gp=gp, standings=standings, thirds=thirds)
 
     data      = st.session_state[cache_key]
     gp        = data["gp"]
     standings = data["standings"]
     thirds    = data["thirds"]
-    r32       = data["r32"]
-    r16       = data["r16"]
-    qf        = data["qf"]
-    sf        = data["sf"]
-    final_m   = data["final_m"]
-    champion  = data["champion"]
 
     # ── tabs ──────────────────────────────────────────────────────────────────
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["⚽ Group Matches", "📊 Group Standings", "🔄 Round of 32", "🏆 Knockouts"]
-    )
+    tab1, tab2 = st.tabs(["⚽ Group Matches", "📊 Group Standings"])
 
     # ── Tab 1: Group Matches ──────────────────────────────────────────────────
     with tab1:
@@ -621,7 +478,7 @@ elif page == "📊 Group Tables":
                         f"letter-spacing:2px;color:#C4981F;margin-bottom:4px'>GROUP {group}</div>",
                         unsafe_allow_html=True)
                     for m in gp[group]:
-                        st.markdown(match_card(m, show_probs=True), unsafe_allow_html=True)
+                        st.markdown(match_card(m), unsafe_allow_html=True)
                     st.markdown("<br>", unsafe_allow_html=True)
 
     # ── Tab 2: Group Standings ────────────────────────────────────────────────
@@ -666,55 +523,9 @@ elif page == "📊 Group Tables":
                    for i, t in enumerate(thirds[:8])]
         st.dataframe(pd.DataFrame(t3_rows), use_container_width=True, hide_index=True)
 
-    # ── Tab 3: Round of 32 ────────────────────────────────────────────────────
-    with tab3:
-        st.caption("All 16 matches of the Round of 32 · (pens) = decided on penalties")
-        c1, c2 = st.columns(2)
-        for i, m in enumerate(r32):
-            col = c1 if i < 8 else c2
-            col.markdown(match_card(m, show_probs=True, ko=True), unsafe_allow_html=True)
-
-    # ── Tab 4: Knockouts ──────────────────────────────────────────────────────
-    with tab4:
-        # Champion banner
-        st.markdown(
-            f"<div style='text-align:center;background:linear-gradient(135deg,#1A0F00,#2A1A00);"
-            f"border:2px solid #C4981F;border-radius:16px;padding:20px;margin-bottom:24px'>"
-            f"<div style='color:#C4981F;font-family:\"Bebas Neue\",sans-serif;"
-            f"font-size:1.1rem;letter-spacing:3px'>PREDICTED CHAMPION</div>"
-            f"<div style='font-size:2.5rem;margin:6px 0'>{TEAM_FLAGS.get(champion, '')}</div>"
-            f"<div style='color:#C4A030;font-family:\"Bebas Neue\",sans-serif;"
-            f"font-size:2rem;letter-spacing:2px'>{champion}</div></div>",
-            unsafe_allow_html=True)
-
-        st.subheader("Round of 16")
-        c1, c2 = st.columns(2)
-        for i, m in enumerate(r16):
-            (c1 if i < 4 else c2).markdown(
-                match_card(m, show_probs=False, ko=True), unsafe_allow_html=True)
-
-        st.divider()
-        st.subheader("Quarter-finals")
-        c1, c2 = st.columns(2)
-        for i, m in enumerate(qf):
-            (c1 if i < 2 else c2).markdown(
-                match_card(m, show_probs=False, ko=True), unsafe_allow_html=True)
-
-        st.divider()
-        st.subheader("Semi-finals")
-        c1, c2 = st.columns(2)
-        for i, m in enumerate(sf):
-            (c1 if i == 0 else c2).markdown(
-                match_card(m, show_probs=False, ko=True), unsafe_allow_html=True)
-
-        st.divider()
-        st.subheader("Final")
-        _, c_mid, _ = st.columns([1, 2, 1])
-        c_mid.markdown(match_card(final_m, show_probs=True, ko=True), unsafe_allow_html=True)
-
 
 # ══════════════════════════════════════════════════════════════════════════════
-# International Predictor — Page 1: Match Predictor
+# WC 2026 — Page 4: Match Predictor
 # ══════════════════════════════════════════════════════════════════════════════
 elif page == "⚔️ Match Predictor":
     st.title("Head-to-Head Match Predictor")
@@ -726,8 +537,9 @@ elif page == "⚔️ Match Predictor":
     if elo_df is None or model is None:
         st.warning("⚠️ Run the data pipeline first (`data_loader.py` → `model.py`)")
     else:
-        from data_loader import FIFA_RANKINGS, TEAM_FLAGS
-        teams         = sorted([t for t in elo_df["team"].tolist() if t in FIFA_RANKINGS])
+        from data_loader import FIFA_RANKINGS, TEAM_FLAGS, WC2026_GROUPS
+        wc_teams      = {t for teams in WC2026_GROUPS.values() for t in teams}
+        teams         = sorted([t for t in elo_df["team"].tolist() if t in wc_teams])
         teams_display = [f"{TEAM_FLAGS.get(t, '')} {t}" for t in teams]
         team_map      = {d: t for d, t in zip(teams_display, teams)}
 
@@ -789,108 +601,7 @@ elif page == "⚔️ Match Predictor":
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# International Predictor — Page 2: Team Profile
-# ══════════════════════════════════════════════════════════════════════════════
-elif page == "👤 Team Profile":
-    st.title("👤 Team Profile")
-    st.caption("Elo history, recent results, and model statistics for any team")
-
-    from data_loader import FIFA_RANKINGS, TEAM_FLAGS, TEAM_CONFEDERATION
-
-    elo_df   = load_elo()
-    matches  = load_matches()
-
-    if elo_df is None or matches is None:
-        st.warning("⚠️ Run `python src/data_loader.py` first.")
-        st.stop()
-
-    all_teams   = sorted(elo_df["team"].tolist())
-    flag_teams  = [f"{TEAM_FLAGS.get(t,'')} {t}" for t in all_teams]
-    team_map    = {f"{TEAM_FLAGS.get(t,'')} {t}": t for t in all_teams}
-
-    default_t   = "🇦🇹 Austria" if "🇦🇹 Austria" in flag_teams else flag_teams[0]
-    sel_display = st.selectbox("Select a team", flag_teams,
-                               index=flag_teams.index(default_t) if default_t in flag_teams else 0)
-    team        = team_map[sel_display]
-
-    st.divider()
-
-    # ── Key metrics ───────────────────────────────────────────────────────────
-    elo_row  = elo_df[elo_df["team"] == team]
-    elo_val  = round(elo_row["elo"].values[0], 1) if not elo_row.empty else "N/A"
-    rd_val   = round(elo_row["rd"].values[0], 1)  if not elo_row.empty and "rd" in elo_row.columns else "N/A"
-    fifa_r   = FIFA_RANKINGS.get(team, "Not ranked")
-    conf     = TEAM_CONFEDERATION.get(team, "Unknown")
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Glicko Rating", elo_val)
-    c2.metric("Rating Deviation", rd_val, help="Lower = more certain about rating")
-    c3.metric("FIFA Ranking", f"#{fifa_r}" if isinstance(fifa_r, int) else fifa_r)
-    c4.metric("Confederation", conf)
-
-    st.divider()
-
-    # ── Elo history chart ─────────────────────────────────────────────────────
-    st.subheader("Rating History")
-    home_hist = matches[matches["home_team"] == team][["date", "elo_home"]].rename(columns={"elo_home": "elo"})
-    away_hist = matches[matches["away_team"] == team][["date", "elo_away"]].rename(columns={"elo_away": "elo"})
-    hist      = pd.concat([home_hist, away_hist]).sort_values("date").drop_duplicates("date")
-
-    if not hist.empty:
-        fig = go.Figure(go.Scatter(
-            x=hist["date"], y=hist["elo"],
-            mode="lines", line=dict(color="#C4981F", width=2),
-            fill="tozeroy", fillcolor="rgba(255,182,39,0.07)",
-        ))
-        fig.update_layout(
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(color="white"), height=300,
-            margin=dict(l=10, r=10, t=10, b=10),
-            xaxis=dict(showgrid=False), yaxis=dict(showgrid=True, gridcolor="#1e2a40"),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No rating history available.")
-
-    st.divider()
-
-    # ── Last 10 matches ───────────────────────────────────────────────────────
-    st.subheader("Last 10 Matches")
-    home_m = matches[matches["home_team"] == team].copy()
-    home_m["opponent"] = home_m["away_team"]
-    home_m["scored"]   = home_m["home_score"]
-    home_m["conceded"] = home_m["away_score"]
-    home_m["venue"]    = "Home"
-
-    away_m = matches[matches["away_team"] == team].copy()
-    away_m["opponent"] = away_m["home_team"]
-    away_m["scored"]   = away_m["away_score"]
-    away_m["conceded"] = away_m["home_score"]
-    away_m["venue"]    = "Away"
-
-    all_m = pd.concat([home_m, away_m]).sort_values("date", ascending=False).head(10)
-
-    if all_m.empty:
-        st.info("No match history found.")
-    else:
-        def result_str(row):
-            if row["scored"] > row["conceded"]:  return "✅ W"
-            if row["scored"] == row["conceded"]: return "🟡 D"
-            return "❌ L"
-
-        display = pd.DataFrame({
-            "Date":       all_m["date"].dt.strftime("%Y-%m-%d"),
-            "Opponent":   all_m["opponent"].map(lambda t: f"{TEAM_FLAGS.get(t,'')} {t}"),
-            "Score":      all_m.apply(lambda r: f"{int(r['scored'])}–{int(r['conceded'])}", axis=1),
-            "Result":     all_m.apply(result_str, axis=1),
-            "Venue":      all_m["venue"],
-            "Tournament": all_m.get("tournament", pd.Series([""] * len(all_m))),
-        })
-        st.dataframe(display, use_container_width=True, hide_index=True)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# International Predictor — Page 3: Model Info
+# WC 2026 — Page 5: Model Info
 # ══════════════════════════════════════════════════════════════════════════════
 elif page == "📖 Model Info":
     st.title("📖 Model Documentation")
@@ -899,62 +610,70 @@ elif page == "📖 Model Info":
     ## How It Works
 
     This predictor uses a **Poisson regression** model — the standard approach in football
-    analytics for modelling goal-scoring — enhanced with several features derived from
-    historical international match data.
+    analytics for modelling goal-scoring — trained on historical international match data
+    and applied to the 48-team WC 2026 field.
 
     ### Core Formula
 
-    For each team in a match, we model goals scored as:
+    For each team in a match, goals scored are modelled as:
 
     > **Goals ~ Poisson(λ)**
 
     Where λ (expected goals) is:
 
-    > **λ = exp(β₀ + β_elo·elo_diff + β_rank·ranking_diff + β_home·is_home + β_form·form_scored + β_squad·squad_rating_diff)**
+    > **λ = exp(β₀ + β_elo·elo_diff + β_rank·ranking_diff + β_home·is_home + β_form·form_scored + β_squad·squad_rating_diff + β_rd·rd_combined)**
 
     Both teams' goals are modelled independently, giving a full joint probability matrix
     over any scoreline. Win/Draw/Loss probabilities are derived from this matrix.
-    A **Dixon-Coles correction** (ρ = −0.13) adjusts probabilities for 0-0 and 1-1 draws.
+    A **Dixon-Coles correction** (ρ = −0.13) adjusts probabilities for low-scoring outcomes.
 
-    ### Features
+    ### Features & Learned Coefficients
 
-    | Feature | Description |
-    |---|---|
-    | `elo_diff` | Glicko rating difference (accounts for uncertainty via RD) |
-    | `ranking_diff` | FIFA ranking difference |
-    | `is_home` | 1 if the team is playing at home (0 for all WC matches) |
-    | `form_scored` | Rolling average goals scored over last 10 matches |
-    | `squad_rating_diff` | EA FC squad average overall rating difference |
+    | Feature | Description | Coefficient |
+    |---|---|---|
+    | `elo_diff` | Glicko-1 rating difference | β = 0.0001 |
+    | `ranking_diff` | FIFA ranking difference | β = −0.0065 |
+    | `is_home` | Home advantage (0 for all WC matches) | β = 0.2517 |
+    | `form_scored` | Rolling avg goals scored, last 10 matches | β = 0.0705 |
+    | `squad_rating_diff` | EA FC squad average overall rating difference | β = 0.0209 |
+    | `rd_combined` | Average Glicko rating deviation — shrinks predictions toward 50/50 for uncertain teams | β = −0.0001 |
 
     ### Training
 
     - **Data**: 50,000+ international matches since 2000 (martj42 Kaggle dataset)
-    - **Ratings**: Glicko-1 (replaces Elo — adds rating deviation for uncertainty)
+    - **Ratings**: Glicko-1 system, which adds a rating deviation (RD) to classic Elo — teams
+      with high RD (less match history) are treated as more uncertain and their predictions
+      pulled slightly toward 50/50
     - **Weighting**: Matches weighted by tournament importance × recency decay
     - **Confederation offsets**: Applied at prediction time to correct for Elo inflation
       from within-confederation play (CONCACAF −100, AFC −80, CAF −50)
 
     ### Tournament Simulation
 
-    The 10,000 Monte Carlo simulations model the full 48-team WC 2026 format:
-    - Group stage (12 groups × 4 teams)
-    - Top 2 per group + 8 best 3rd-place teams = 32 in R32
-    - Knockout rounds to Final; draws resolved by 50/50 penalty shootout
+    The Tournament Odds page runs 10,000 Monte Carlo simulations of the full WC 2026 format:
+    - Group stage: 12 groups × 4 teams, 6 matches each
+    - Top 2 per group + 8 best 3rd-place teams = 32 teams in Round of 32
+    - Knockout rounds through to the Final; draws go to a 50/50 penalty shootout
+
+    The Group Stage Predictor shows the model's single most likely scoreline for each of the
+    72 group matches, with predicted final standings.
 
     ### Known Limitations
 
     - No injury or suspension data
-    - No actual lineup / formation data
+    - No actual lineup or formation data
     - EA FC ratings underestimate some non-European players
-    - Penalty shootout modelled as 50/50 (no historical shootout records)
+    - Penalty shootouts modelled as 50/50 (no historical shootout data)
     """)
 
     elo_df = load_elo()
     if elo_df is not None:
         st.divider()
-        st.subheader("Current Glicko Ratings — Top 30")
-        top30 = elo_df.head(30).copy()
-        if "rd" in top30.columns:
-            top30["rd"] = top30["rd"].round(1)
-        top30["elo"] = top30["elo"].round(1)
-        st.dataframe(top30, use_container_width=True, hide_index=True)
+        from data_loader import WC2026_GROUPS
+        wc_teams = {t for teams in WC2026_GROUPS.values() for t in teams}
+        st.subheader("Current Glicko Ratings — WC 2026 Teams")
+        wc_elo = elo_df[elo_df["team"].isin(wc_teams)].copy()
+        if "rd" in wc_elo.columns:
+            wc_elo["rd"] = wc_elo["rd"].round(1)
+        wc_elo["elo"] = wc_elo["elo"].round(1)
+        st.dataframe(wc_elo, use_container_width=True, hide_index=True)

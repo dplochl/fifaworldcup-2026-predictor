@@ -80,34 +80,6 @@ def assign_third_place(qualifying_thirds: list) -> dict:
     return assignment
 
 
-def simulate_match(
-    team_a: str,
-    team_b: str,
-    model: PoissonMatchPredictor,
-    elo: dict,
-    rankings: dict,
-    neutral: bool = True,
-) -> str:
-    """
-    Simulate a single match. Returns winner (or handles draw for group stage).
-    For knockout: draws resolved by penalty shootout (50/50).
-    """
-    elo_a = get_team_elo(team_a, elo)
-    elo_b = get_team_elo(team_b, elo)
-    rank_a = get_team_ranking(team_a, rankings)
-    rank_b = get_team_ranking(team_b, rankings)
-
-    pred = model.predict_match(elo_a, elo_b, rank_a, rank_b, neutral)
-
-    # Sample outcome
-    r = np.random.random()
-    if r < pred["prob_home_win"]:
-        return team_a, team_b  # winner, loser
-    elif r < pred["prob_home_win"] + pred["prob_draw"]:
-        return None, None  # draw (group stage)
-    else:
-        return team_b, team_a
-
 
 def simulate_group(
     teams: list,

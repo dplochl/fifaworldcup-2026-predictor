@@ -1,17 +1,14 @@
 """
 data_loader.py
 --------------
-Downloads and preprocesses all data needed for the WC 2026 predictor.
+Data pipeline for the WC 2026 predictor.
 
-Data sources:
-  - Kaggle: international football results 1872–2024
-  - eloratings.net: historical Elo ratings
-  - WC 2026 group fixtures (hardcoded from official draw)
+Loads and preprocesses historical match data, computes Glicko-1 ratings,
+and saves all outputs to data/processed/.
 """
 
 import pandas as pd
 import numpy as np
-import requests
 from collections import defaultdict
 from pathlib import Path
 
@@ -361,9 +358,6 @@ def compute_glicko_ratings(
     return df, ratings
 
 
-# Keep old name as alias so nothing external breaks
-compute_elo_ratings = compute_glicko_ratings
-
 
 def compute_team_form(df: pd.DataFrame, window: int = 10) -> pd.DataFrame:
     """
@@ -591,7 +585,7 @@ if __name__ == "__main__":
     else:
         df = filter_recent(df, since_year=2000)
         df = add_fifa_rankings(df)
-        df, elo = compute_elo_ratings(df)
+        df, elo = compute_glicko_ratings(df)
         df = compute_team_form(df)
         squad_ratings = load_squad_ratings()
         df = add_squad_ratings(df, squad_ratings)
